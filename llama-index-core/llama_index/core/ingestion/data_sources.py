@@ -70,9 +70,7 @@ class ConfigurableComponent(Enum):
             )
         elif isinstance(component, BasePydanticReader):
             reader_config = ReaderConfig(reader=component)
-            return ConfiguredDataSource[ReaderConfig](
-                component=reader_config
-            )  # type: ignore
+            return ConfiguredDataSource[ReaderConfig](component=reader_config)  # type: ignore
 
         if isinstance(component, DocumentGroup) and name is None:
             # if the component is a DocumentGroup, we want to use the
@@ -82,7 +80,7 @@ class ConfigurableComponent(Enum):
 
         if name is None:
             suffix = uuid.uuid1()
-            name = self.value.name + f" [{suffix}]]"
+            name = self.value.name + f" [{suffix}]"
         return ConfiguredDataSource[component_type](  # type: ignore
             component=component, name=name
         )

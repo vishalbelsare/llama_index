@@ -1,4 +1,4 @@
-import asyncio
+import inspect
 from contextlib import contextmanager
 from typing import (
     Any,
@@ -49,12 +49,12 @@ def llm_chat_callback() -> Callable:
         async def wrapped_async_llm_chat(
             _self: Any, messages: Sequence[ChatMessage], **kwargs: Any
         ) -> Any:
-            with wrapper_logic(_self) as callback_manager, callback_manager.as_trace(
-                "chat"
+            with (
+                wrapper_logic(_self) as callback_manager,
+                callback_manager.as_trace("chat"),
             ):
                 span_id = active_span_id.get()
-                model_dict = _self.to_dict()
-                model_dict.pop("api_key", None)
+                model_dict = _self.to_payload()
                 dispatcher.event(
                     LLMChatStartEvent(
                         model_dict=model_dict,
@@ -68,9 +68,12 @@ def llm_chat_callback() -> Callable:
                     payload={
                         EventPayload.MESSAGES: messages,
                         EventPayload.ADDITIONAL_KWARGS: kwargs,
-                        EventPayload.SERIALIZED: _self.to_dict(),
+                        EventPayload.SERIALIZED: model_dict,
                     },
                 )
+                if _self.rate_limiter is not None:
+                    await _self.rate_limiter.async_acquire()
+
                 try:
                     f_return_val = await f(_self, messages, **kwargs)
                 except BaseException as e:
@@ -147,12 +150,12 @@ def llm_chat_callback() -> Callable:
         def wrapped_llm_chat(
             _self: Any, messages: Sequence[ChatMessage], **kwargs: Any
         ) -> Any:
-            with wrapper_logic(_self) as callback_manager, callback_manager.as_trace(
-                "chat"
+            with (
+                wrapper_logic(_self) as callback_manager,
+                callback_manager.as_trace("chat"),
             ):
                 span_id = active_span_id.get()
-                model_dict = _self.to_dict()
-                model_dict.pop("api_key", None)
+                model_dict = _self.to_payload()
                 dispatcher.event(
                     LLMChatStartEvent(
                         model_dict=model_dict,
@@ -166,9 +169,12 @@ def llm_chat_callback() -> Callable:
                     payload={
                         EventPayload.MESSAGES: messages,
                         EventPayload.ADDITIONAL_KWARGS: kwargs,
-                        EventPayload.SERIALIZED: _self.to_dict(),
+                        EventPayload.SERIALIZED: model_dict,
                     },
                 )
+                if _self.rate_limiter is not None:
+                    _self.rate_limiter.acquire()
+
                 try:
                     f_return_val = f(_self, messages, **kwargs)
                 except BaseException as e:
@@ -269,7 +275,7 @@ def llm_chat_callback() -> Callable:
                 setattr(dummy_wrapper, attr, v)
                 setattr(wrapped_llm_chat, attr, v)
 
-        if asyncio.iscoroutinefunction(f):
+        if inspect.iscoroutinefunction(f):
             if is_wrapped:
                 return async_dummy_wrapper
             else:
@@ -307,12 +313,12 @@ def llm_completion_callback() -> Callable:
             _self: Any, *args: Any, **kwargs: Any
         ) -> Any:
             prompt = extract_prompt(*args, **kwargs)
-            with wrapper_logic(_self) as callback_manager, callback_manager.as_trace(
-                "completion"
+            with (
+                wrapper_logic(_self) as callback_manager,
+                callback_manager.as_trace("completion"),
             ):
                 span_id = active_span_id.get()
-                model_dict = _self.to_dict()
-                model_dict.pop("api_key", None)
+                model_dict = _self.to_payload()
                 dispatcher.event(
                     LLMCompletionStartEvent(
                         model_dict=model_dict,
@@ -326,9 +332,12 @@ def llm_completion_callback() -> Callable:
                     payload={
                         EventPayload.PROMPT: prompt,
                         EventPayload.ADDITIONAL_KWARGS: kwargs,
-                        EventPayload.SERIALIZED: _self.to_dict(),
+                        EventPayload.SERIALIZED: model_dict,
                     },
                 )
+
+                if _self.rate_limiter is not None:
+                    await _self.rate_limiter.async_acquire()
 
                 try:
                     f_return_val = await f(_self, *args, **kwargs)
@@ -405,12 +414,12 @@ def llm_completion_callback() -> Callable:
 
         def wrapped_llm_predict(_self: Any, *args: Any, **kwargs: Any) -> Any:
             prompt = extract_prompt(*args, **kwargs)
-            with wrapper_logic(_self) as callback_manager, callback_manager.as_trace(
-                "completion"
+            with (
+                wrapper_logic(_self) as callback_manager,
+                callback_manager.as_trace("completion"),
             ):
                 span_id = active_span_id.get()
-                model_dict = _self.to_dict()
-                model_dict.pop("api_key", None)
+                model_dict = _self.to_payload()
                 dispatcher.event(
                     LLMCompletionStartEvent(
                         model_dict=model_dict,
@@ -424,9 +433,12 @@ def llm_completion_callback() -> Callable:
                     payload={
                         EventPayload.PROMPT: prompt,
                         EventPayload.ADDITIONAL_KWARGS: kwargs,
-                        EventPayload.SERIALIZED: _self.to_dict(),
+                        EventPayload.SERIALIZED: model_dict,
                     },
                 )
+                if _self.rate_limiter is not None:
+                    _self.rate_limiter.acquire()
+
                 try:
                     f_return_val = f(_self, *args, **kwargs)
                 except BaseException as e:
@@ -527,7 +539,7 @@ def llm_completion_callback() -> Callable:
                 setattr(dummy_wrapper, attr, v)
                 setattr(wrapped_llm_predict, attr, v)
 
-        if asyncio.iscoroutinefunction(f):
+        if inspect.iscoroutinefunction(f):
             if is_wrapped:
                 return async_dummy_wrapper
             else:

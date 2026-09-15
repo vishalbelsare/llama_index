@@ -10,17 +10,19 @@ from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.callbacks.base import CallbackManager
 from llama_index.core.base.llms.generic_utils import get_from_param_or_env
 
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 
 class MistralAIEmbedding(BaseEmbedding):
-    """Class for MistralAI embeddings.
+    """
+    Class for MistralAI embeddings.
 
     Args:
         model_name (str): Model for embedding.
             Defaults to "mistral-embed".
 
         api_key (Optional[str]): API key to access the model. Defaults to None.
+
     """
 
     # Instance variables initialized via Pydantic's mechanism

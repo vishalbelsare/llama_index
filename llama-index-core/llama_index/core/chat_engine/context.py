@@ -1,4 +1,5 @@
-from typing import Any, List, Optional
+import asyncio
+from typing import Any, List, Optional, Union
 
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.base.llms.types import (
@@ -20,8 +21,10 @@ from llama_index.core.chat_engine.types import (
     ToolOutput,
 )
 from llama_index.core.llms.llm import LLM
-from llama_index.core.memory import BaseMemory, ChatMemoryBuffer
+from llama_index.core.memory import BaseMemory, Memory
+from llama_index.core.types import Thread
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
+from llama_index.core.prompts import PromptTemplate
 from llama_index.core.response_synthesizers import CompactAndRefine
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.settings import Settings
@@ -65,8 +68,8 @@ class ContextChatEngine(BaseChatEngine):
         memory: BaseMemory,
         prefix_messages: List[ChatMessage],
         node_postprocessors: Optional[List[BaseNodePostprocessor]] = None,
-        context_template: Optional[str] = None,
-        context_refine_template: Optional[str] = None,
+        context_template: Optional[Union[str, PromptTemplate]] = None,
+        context_refine_template: Optional[Union[str, PromptTemplate]] = None,
         callback_manager: Optional[CallbackManager] = None,
     ) -> None:
         self._retriever = retriever
@@ -74,10 +77,16 @@ class ContextChatEngine(BaseChatEngine):
         self._memory = memory
         self._prefix_messages = prefix_messages
         self._node_postprocessors = node_postprocessors or []
-        self._context_template = context_template or DEFAULT_CONTEXT_TEMPLATE
-        self._context_refine_template = (
-            context_refine_template or DEFAULT_REFINE_TEMPLATE
-        )
+
+        context_template = context_template or DEFAULT_CONTEXT_TEMPLATE
+        if isinstance(context_template, str):
+            context_template = PromptTemplate(context_template)
+        self._context_template = context_template
+
+        context_refine_template = context_refine_template or DEFAULT_REFINE_TEMPLATE
+        if isinstance(context_refine_template, str):
+            context_refine_template = PromptTemplate(context_refine_template)
+        self._context_refine_template = context_refine_template
 
         self.callback_manager = callback_manager or CallbackManager([])
         for node_postprocessor in self._node_postprocessors:
@@ -92,8 +101,8 @@ class ContextChatEngine(BaseChatEngine):
         system_prompt: Optional[str] = None,
         prefix_messages: Optional[List[ChatMessage]] = None,
         node_postprocessors: Optional[List[BaseNodePostprocessor]] = None,
-        context_template: Optional[str] = None,
-        context_refine_template: Optional[str] = None,
+        context_template: Optional[Union[str, PromptTemplate]] = None,
+        context_refine_template: Optional[Union[str, PromptTemplate]] = None,
         llm: Optional[LLM] = None,
         **kwargs: Any,
     ) -> "ContextChatEngine":
@@ -101,7 +110,7 @@ class ContextChatEngine(BaseChatEngine):
         llm = llm or Settings.llm
 
         chat_history = chat_history or []
-        memory = memory or ChatMemoryBuffer.from_defaults(
+        memory = memory or Memory.from_defaults(
             chat_history=chat_history, token_limit=llm.metadata.context_window - 256
         )
 
@@ -142,7 +151,7 @@ class ContextChatEngine(BaseChatEngine):
         """Generate context information from a message."""
         nodes = await self._retriever.aretrieve(message)
         for postprocessor in self._node_postprocessors:
-            nodes = postprocessor.postprocess_nodes(
+            nodes = await postprocessor.apostprocess_nodes(
                 nodes, query_bundle=QueryBundle(message)
             )
 
@@ -179,7 +188,13 @@ class ContextChatEngine(BaseChatEngine):
 
         # Get the response synthesizer
         return get_response_synthesizer(
-            self._llm, self.callback_manager, qa_messages, refine_messages, streaming
+            self._llm,
+            self.callback_manager,
+            qa_messages,
+            refine_messages,
+            streaming,
+            qa_function_mappings=self._context_template.function_mappings,
+            refine_function_mappings=self._context_refine_template.function_mappings,
         )
 
     @trace_method("chat")
@@ -204,7 +219,7 @@ class ContextChatEngine(BaseChatEngine):
         synthesizer = self._get_response_synthesizer(chat_history)
 
         response = synthesizer.synthesize(message, nodes)
-        user_message = ChatMessage(content=message, role=MessageRole.USER)
+        user_message = ChatMessage(content=str(message), role=MessageRole.USER)
         ai_message = ChatMessage(content=str(response), role=MessageRole.ASSISTANT)
 
         self._memory.put(user_message)
@@ -247,6 +262,8 @@ class ContextChatEngine(BaseChatEngine):
         response = synthesizer.synthesize(message, nodes)
         assert isinstance(response, StreamingResponse)
 
+        self._memory.put(ChatMessage(content=str(message), role=MessageRole.USER))
+
         def wrapped_gen(response: StreamingResponse) -> ChatResponseGen:
             full_response = ""
             for token in response.response_gen:
@@ -258,12 +275,7 @@ class ContextChatEngine(BaseChatEngine):
                     delta=token,
                 )
 
-            user_message = ChatMessage(content=message, role=MessageRole.USER)
-            ai_message = ChatMessage(content=full_response, role=MessageRole.ASSISTANT)
-            self._memory.put(user_message)
-            self._memory.put(ai_message)
-
-        return StreamingAgentChatResponse(
+        chat_response = StreamingAgentChatResponse(
             chat_stream=wrapped_gen(response),
             sources=[
                 ToolOutput(
@@ -274,8 +286,13 @@ class ContextChatEngine(BaseChatEngine):
                 )
             ],
             source_nodes=nodes,
-            is_writing_to_memory=False,
         )
+        thread = Thread(
+            target=chat_response.write_response_to_history, args=(self._memory,)
+        )
+        chat_response.write_response_to_history_thread = thread
+        thread.start()
+        return chat_response
 
     @trace_method("chat")
     async def achat(
@@ -285,7 +302,7 @@ class ContextChatEngine(BaseChatEngine):
         prev_chunks: Optional[List[NodeWithScore]] = None,
     ) -> AgentChatResponse:
         if chat_history is not None:
-            self._memory.set(chat_history)
+            await self._memory.aset(chat_history)
 
         # get nodes and postprocess them
         nodes = await self._aget_nodes(message)
@@ -293,13 +310,13 @@ class ContextChatEngine(BaseChatEngine):
             nodes = prev_chunks
 
         # Get the response synthesizer with dynamic prompts
-        chat_history = self._memory.get(
+        chat_history = await self._memory.aget(
             input=message,
         )
         synthesizer = self._get_response_synthesizer(chat_history)
 
         response = await synthesizer.asynthesize(message, nodes)
-        user_message = ChatMessage(content=message, role=MessageRole.USER)
+        user_message = ChatMessage(content=str(message), role=MessageRole.USER)
         ai_message = ChatMessage(content=str(response), role=MessageRole.ASSISTANT)
 
         await self._memory.aput(user_message)
@@ -326,20 +343,24 @@ class ContextChatEngine(BaseChatEngine):
         prev_chunks: Optional[List[NodeWithScore]] = None,
     ) -> StreamingAgentChatResponse:
         if chat_history is not None:
-            self._memory.set(chat_history)
+            await self._memory.aset(chat_history)
         # get nodes and postprocess them
         nodes = await self._aget_nodes(message)
         if len(nodes) == 0 and prev_chunks is not None:
             nodes = prev_chunks
 
         # Get the response synthesizer with dynamic prompts
-        chat_history = self._memory.get(
+        chat_history = await self._memory.aget(
             input=message,
         )
         synthesizer = self._get_response_synthesizer(chat_history, streaming=True)
 
         response = await synthesizer.asynthesize(message, nodes)
         assert isinstance(response, AsyncStreamingResponse)
+
+        await self._memory.aput(
+            ChatMessage(content=str(message), role=MessageRole.USER)
+        )
 
         async def wrapped_gen(response: AsyncStreamingResponse) -> ChatResponseAsyncGen:
             full_response = ""
@@ -352,12 +373,7 @@ class ContextChatEngine(BaseChatEngine):
                     delta=token,
                 )
 
-            user_message = ChatMessage(content=message, role=MessageRole.USER)
-            ai_message = ChatMessage(content=full_response, role=MessageRole.ASSISTANT)
-            await self._memory.aput(user_message)
-            await self._memory.aput(ai_message)
-
-        return StreamingAgentChatResponse(
+        chat_response = StreamingAgentChatResponse(
             achat_stream=wrapped_gen(response),
             sources=[
                 ToolOutput(
@@ -368,8 +384,11 @@ class ContextChatEngine(BaseChatEngine):
                 )
             ],
             source_nodes=nodes,
-            is_writing_to_memory=False,
         )
+        chat_response.awrite_response_to_history_task = asyncio.create_task(
+            chat_response.awrite_response_to_history(self._memory)
+        )
+        return chat_response
 
     def reset(self) -> None:
         self._memory.reset()

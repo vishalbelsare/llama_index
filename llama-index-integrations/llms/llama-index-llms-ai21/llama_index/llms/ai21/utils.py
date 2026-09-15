@@ -15,13 +15,18 @@ JAMBA_MODELS = {
     "jamba-1.5-mini": 256_000,
     "jamba-1.5-large": 256_000,
     "jamba-1.5": 256_000,
+    # Legacy Jurassic-2 models
+    "j2-light": 8_192,
+    "j2-mid": 8_192,
+    "j2-ultra": 8_192,
 }
 
 _SYSTEM_ERR_MESSAGE = "System message must be at beginning of message list."
 
 
 def ai21_model_to_context_size(model: str) -> Union[int, None]:
-    """Calculate the maximum number of tokens possible to generate for a model.
+    """
+    Calculate the maximum number of tokens possible to generate for a model.
 
     Args:
         model: The modelname we want to know the context size for.
@@ -30,7 +35,7 @@ def ai21_model_to_context_size(model: str) -> Union[int, None]:
         The maximum context size
 
     """
-    token_limit = JAMBA_MODELS.get(model, None)
+    token_limit = JAMBA_MODELS.get(model)
 
     if token_limit is None:
         raise ValueError(f"Model name {model} not found in {JAMBA_MODELS.keys()}")

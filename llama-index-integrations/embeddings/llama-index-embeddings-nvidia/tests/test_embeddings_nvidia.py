@@ -8,6 +8,7 @@ from llama_index.embeddings.nvidia import NVIDIAEmbedding
 from openai import AuthenticationError
 
 from pytest_httpx import HTTPXMock
+import httpx
 
 
 @pytest.fixture()
@@ -32,20 +33,39 @@ def test_embedding_class():
 def test_nvidia_embedding_param_setting():
     emb = NVIDIAEmbedding(
         api_key="BOGUS",
-        model="test-model",
+        model="NV-Embed-QA",
         truncate="END",
         timeout=20,
         max_retries=10,
         embed_batch_size=15,
     )
 
-    assert emb.model == "test-model"
+    assert emb.model == "NV-Embed-QA"
     assert emb.truncate == "END"
     assert emb._client.timeout == 20
     assert emb._client.max_retries == 10
     assert emb._aclient.timeout == 20
     assert emb._aclient.max_retries == 10
     assert emb.embed_batch_size == 15
+
+
+def test_nvidia_embedding_custom_http_clients():
+    sync_client = httpx.Client(verify=False)
+    async_client = httpx.AsyncClient(verify=False)
+
+    emb = NVIDIAEmbedding(
+        api_key="BOGUS",
+        model="NV-Embed-QA",
+        http_client=sync_client,
+        async_http_client=async_client,
+    )
+
+    assert emb._http_client is sync_client
+    assert emb._async_http_client is async_client
+
+    # Ensure the underlying OpenAI clients were constructed with the custom clients
+    assert emb._client._client is sync_client
+    assert emb._aclient._client is async_client
 
 
 def test_nvidia_embedding_throws_on_batches_larger_than_259():
@@ -90,3 +110,29 @@ def test_nvidia_embedding_callback(mock_integration_api):
 def test_nvidia_embedding_throws_with_invalid_key(mock_integration_api):
     emb = NVIDIAEmbedding(api_key="invalid")
     emb.get_text_embedding("hi")
+
+
+# @pytest.mark.parametrize("model", list(MODEL_ENDPOINT_MAP.keys()))
+# def test_model_compatible_client_model(model: str) -> None:
+#     NVIDIAEmbedding(api_key="BOGUS", model=model)
+
+
+# marking this as xfail as we do not return invalid error anymore
+@pytest.mark.xfail(reason="value error is not raised anymore")
+def test_model_incompatible_client_model() -> None:
+    model_name = "x"
+    err_msg = (
+        f"Model {model_name} is incompatible with client NVIDIAEmbedding. "
+        f"Please check `NVIDIAEmbedding.available_models`."
+    )
+    with pytest.raises(ValueError) as msg:
+        NVIDIAEmbedding(api_key="BOGUS", model=model_name)
+    assert err_msg == str(msg.value)
+
+
+def test_model_incompatible_client_known_model() -> None:
+    model_name = "google/deplot"
+    warn_msg = f"Unable to determine validity"
+    with pytest.warns(UserWarning) as msg:
+        NVIDIAEmbedding(api_key="BOGUS", model=model_name)
+    assert warn_msg in str(msg[0].message)

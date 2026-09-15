@@ -2,8 +2,10 @@
 
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import (
     Any,
+    AsyncIterator,
     Callable,
     Dict,
     List,
@@ -45,11 +47,16 @@ from llama_index.core.llms.function_calling import FunctionCallingLLM
 
 from azure.ai.inference import ChatCompletionsClient
 from azure.ai.inference.aio import ChatCompletionsClient as ChatCompletionsClientAsync
+from azure.ai.inference.models import (
+    ChatCompletionsToolChoicePreset,
+    ChatCompletionsNamedToolChoice,
+)
 
 if TYPE_CHECKING:
     from llama_index.core.tools.types import BaseTool
     from llama_index.core.chat_engine.types import AgentChatResponse
     from azure.core.credentials import TokenCredential
+
 
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError
@@ -65,7 +72,8 @@ logger = logging.getLogger(__name__)
 def to_inference_message(
     messages: Sequence[ChatMessage],
 ) -> List[ChatRequestMessage]:
-    """Converts a sequence of `ChatMessage` to a list of `ChatRequestMessage`
+    """
+    Converts a sequence of `ChatMessage` to a list of `ChatRequestMessage`
     which can be used for Azure AI model inference.
 
     Args:
@@ -73,6 +81,7 @@ def to_inference_message(
 
     Returns:
         List[ChatRequestMessage]: The converted messages.
+
     """
     new_messages = []
     for m in messages:
@@ -89,13 +98,15 @@ def to_inference_message(
 
 
 def to_inference_tool(metadata: Type[BaseModel]) -> Dict[str, Any]:
-    """Converts a tool metadata to a tool dict for Azure AI model inference.
+    """
+    Converts a tool metadata to a tool dict for Azure AI model inference.
 
     Args:
         tool_metadata (Type[ToolMedata]): The metadata of the tool to convert.
 
     Returns:
         Dict[str, Any]: The converted tool dict.
+
     """
     return {
         "type": "function",
@@ -123,10 +134,12 @@ def from_inference_message(message: ChatResponseMessage) -> ChatMessage:
 
 
 def force_single_tool_call(response: ChatResponse) -> None:
-    """Forces the response to have only one tool call.
+    """
+    Forces the response to have only one tool call.
 
     Args:
         response (ChatResponse): The response to modify.
+
     """
     tool_calls = response.message.additional_kwargs.get("tool_calls", [])
     if len(tool_calls) > 1:
@@ -134,7 +147,8 @@ def force_single_tool_call(response: ChatResponse) -> None:
 
 
 class AzureAICompletionsModel(FunctionCallingLLM):
-    """Azure AI model inference for LLM.
+    """
+    Azure AI model inference for LLM.
 
     Examples:
         ```python
@@ -177,6 +191,7 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         # Once the client is instantiated, you can set the context to use the model
         Settings.llm = llm
         ```
+
     """
 
     model_config = ConfigDict(protected_namespaces=())
@@ -202,7 +217,8 @@ class AzureAICompletionsModel(FunctionCallingLLM):
     )
 
     _client: ChatCompletionsClient = PrivateAttr()
-    _async_client: ChatCompletionsClientAsync = PrivateAttr()
+    _async_client_class: Type[ChatCompletionsClientAsync] = PrivateAttr()
+    _async_client_kwargs: Dict[str, Any] = PrivateAttr()
     _model_name: str = PrivateAttr(None)
     _model_type: str = PrivateAttr(None)
     _model_provider: str = PrivateAttr(None)
@@ -214,6 +230,7 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         temperature: float = DEFAULT_TEMPERATURE,
         max_tokens: Optional[int] = None,
         model_name: Optional[str] = None,
+        api_version: Optional[str] = None,
         callback_manager: Optional[CallbackManager] = None,
         system_prompt: Optional[str] = None,
         messages_to_prompt: Optional[Callable[[Sequence[ChatMessage]], str]] = None,
@@ -223,7 +240,7 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         client_kwargs: Dict[str, Any] = None,
         **kwargs: Dict[str, Any],
     ) -> None:
-        client_kwargs = client_kwargs or {}
+        client_kwargs = dict(client_kwargs or {})
         callback_manager = callback_manager or CallbackManager([])
 
         endpoint = get_from_param_or_env(
@@ -251,6 +268,9 @@ class AzureAICompletionsModel(FunctionCallingLLM):
                 "Pass the credential as a parameter or set the AZURE_INFERENCE_CREDENTIAL"
             )
 
+        if api_version:
+            client_kwargs["api_version"] = api_version
+
         super().__init__(
             model_name=model_name,
             temperature=temperature,
@@ -271,12 +291,25 @@ class AzureAICompletionsModel(FunctionCallingLLM):
             **client_kwargs,
         )
 
-        self._async_client = ChatCompletionsClientAsync(
+        # Save async client config so each async request can create
+        # and close its own short-lived client.
+        self._async_client_class = ChatCompletionsClientAsync
+        self._async_client_kwargs = dict(
             endpoint=endpoint,
             credential=credential,
             user_agent="llamaindex",
             **client_kwargs,
         )
+
+    def _create_async_client(self) -> ChatCompletionsClientAsync:
+        return self._async_client_class(**self._async_client_kwargs)
+
+    @asynccontextmanager
+    async def _get_request_async_client(
+        self,
+    ) -> AsyncIterator[ChatCompletionsClientAsync]:
+        async with self._create_async_client() as async_client:
+            yield async_client
 
     @classmethod
     def class_name(cls) -> str:
@@ -345,6 +378,16 @@ class AzureAICompletionsModel(FunctionCallingLLM):
             raw=response.as_dict(),
         )
 
+    def _to_azure_tool_choice(
+        self, tool_required: bool
+    ) -> Optional[
+        Union[str, ChatCompletionsToolChoicePreset, ChatCompletionsNamedToolChoice]
+    ]:
+        if tool_required:
+            return ChatCompletionsToolChoicePreset.REQUIRED
+        else:
+            return ChatCompletionsToolChoicePreset.AUTO
+
     @llm_completion_callback()
     def complete(
         self, prompt: str, formatted: bool = False, **kwargs: Any
@@ -392,7 +435,8 @@ class AzureAICompletionsModel(FunctionCallingLLM):
     ) -> ChatResponse:
         messages = to_inference_message(messages)
         all_kwargs = self._get_all_kwargs(**kwargs)
-        response = await self._async_client.complete(messages=messages, **all_kwargs)
+        async with self._get_request_async_client() as async_client:
+            response = await async_client.complete(messages=messages, **all_kwargs)
 
         response_message = from_inference_message(response.choices[0].message)
 
@@ -415,27 +459,28 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         messages = to_inference_message(messages)
         all_kwargs = self._get_all_kwargs(**kwargs)
 
-        response = self._async_client.complete(
-            messages=messages, stream=True, **all_kwargs
-        )
-
-        async def gen() -> ChatResponseAsyncGen:
-            content = ""
-            role = MessageRole.ASSISTANT
-            async for chunk in response:
-                content_delta = (
-                    chunk.choices[0].delta.content if chunk.choices else None
-                )
-                if content_delta is None:
-                    continue
-                content += content_delta
-                yield ChatResponse(
-                    message=ChatMessage(role=role, content=content),
-                    delta=content_delta,
-                    raw=chunk,
+        async def stream_gen() -> ChatResponseAsyncGen:
+            async with self._get_request_async_client() as async_client:
+                response = await async_client.complete(
+                    messages=messages, stream=True, **all_kwargs
                 )
 
-        return gen()
+                content = ""
+                role = MessageRole.ASSISTANT
+                async for chunk in response:
+                    content_delta = (
+                        chunk.choices[0].delta.content if chunk.choices else None
+                    )
+                    if content_delta is None:
+                        continue
+                    content += content_delta
+                    yield ChatResponse(
+                        message=ChatMessage(role=role, content=content),
+                        delta=content_delta,
+                        raw=chunk,
+                    )
+
+        return stream_gen()
 
     @llm_completion_callback()
     async def astream_complete(
@@ -451,6 +496,7 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         chat_history: Optional[List[ChatMessage]] = None,
         verbose: bool = False,
         allow_parallel_tool_calls: bool = False,
+        tool_required: bool = False,
         **kwargs: Any,
     ) -> ChatResponse:
         """Predict and call the tool."""
@@ -469,6 +515,7 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         response = self.chat(
             messages,
             tools=tool_specs,
+            tool_choice=self._to_azure_tool_choice(tool_required),
             **kwargs,
         )
         if not allow_parallel_tool_calls:
@@ -482,6 +529,7 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         chat_history: Optional[List[ChatMessage]] = None,
         verbose: bool = False,
         allow_parallel_tool_calls: bool = False,
+        tool_required: bool = False,
         **kwargs: Any,
     ) -> ChatResponse:
         """Predict and call the tool."""
@@ -500,6 +548,7 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         response = await self.achat(
             messages,
             tools=tool_specs,
+            tool_choice=self._to_azure_tool_choice(tool_required),
             **kwargs,
         )
         if not allow_parallel_tool_calls:
@@ -549,6 +598,7 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         chat_history: Optional[List[ChatMessage]] = None,
         verbose: bool = False,
         allow_parallel_tool_calls: bool = False,
+        tool_required: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Prepare the arguments needed to let the LLM chat with tools."""
@@ -563,5 +613,6 @@ class AzureAICompletionsModel(FunctionCallingLLM):
         return {
             "messages": chat_history,
             "tools": tool_dicts or None,
+            "tool_choice": self._to_azure_tool_choice(tool_required),
             **kwargs,
         }

@@ -35,7 +35,8 @@ class SubQuestionAnswerPair(BaseModel):
 
 
 class SubQuestionQueryEngine(BaseQueryEngine):
-    """Sub question query engine.
+    """
+    Sub question query engine.
 
     A query engine that breaks down a complex query (e.g. compare and contrast) into
         many sub questions and their target query engine for execution.
@@ -53,6 +54,7 @@ class SubQuestionQueryEngine(BaseQueryEngine):
             Defaults to True
         use_async (bool): whether to execute the sub questions with asyncio.
             Defaults to True
+
     """
 
     def __init__(
@@ -240,8 +242,11 @@ class SubQuestionQueryEngine(BaseQueryEngine):
                 event.on_end(payload={EventPayload.SUB_QUESTION: qa_pair})
 
             return qa_pair
-        except ValueError:
-            logger.warning(f"[{sub_q.tool_name}] Failed to run {question}")
+        except Exception:
+            logger.warning(
+                f"[{sub_q.tool_name}] Failed to run {question}",
+                exc_info=True,
+            )
             return None
 
     def _query_subq(
@@ -271,6 +276,9 @@ class SubQuestionQueryEngine(BaseQueryEngine):
                 event.on_end(payload={EventPayload.SUB_QUESTION: qa_pair})
 
             return qa_pair
-        except ValueError:
-            logger.warning(f"[{sub_q.tool_name}] Failed to run {question}")
+        except Exception:
+            logger.warning(
+                f"[{sub_q.tool_name}] Failed to run {question}",
+                exc_info=True,
+            )
             return None

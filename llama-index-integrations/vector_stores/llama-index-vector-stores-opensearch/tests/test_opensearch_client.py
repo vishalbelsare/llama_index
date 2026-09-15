@@ -5,6 +5,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import List, Generator, Set
+from unittest import mock
 
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 from llama_index.vector_stores.opensearch import (
@@ -17,6 +18,7 @@ from llama_index.core.vector_stores.types import (
     MetadataFilter,
     MetadataFilters,
     VectorStoreQuery,
+    VectorStoreQueryMode,
 )
 
 ##
@@ -25,7 +27,7 @@ from llama_index.core.vector_stores.types import (
 # docker-compose up
 #
 # Run tests
-# pytest test_opensearch_client.py
+# uv run -- pytest test_opensearch_client.py
 
 logging.basicConfig(level=logging.DEBUG)
 evt_loop = asyncio.get_event_loop()
@@ -83,8 +85,32 @@ def os_store(index_name: str) -> Generator[OpensearchVectorStore, None, None]:
     # delete index
     client._os_client.indices.delete(index=index_name)
     # close client
-    client._os_client.close()
-    client._os_async_client.close()
+    client.close()
+
+
+@pytest.fixture()
+def os_stores() -> Generator[List[OpensearchVectorStore], None, None]:
+    client1 = OpensearchVectorClient(
+        endpoint="localhost:9200",
+        index=f"test_{uuid.uuid4().hex}",
+        dim=3,
+    )
+    client2 = OpensearchVectorClient(
+        endpoint="localhost:9200",
+        index=f"test_{uuid.uuid4().hex}",
+        dim=3,
+        engine="lucene",
+    )
+
+    stores = [OpensearchVectorStore(client1), OpensearchVectorStore(client2)]
+    yield stores
+
+    for client in [client1, client2]:
+        # teardown step
+        # delete index
+        client._os_client.indices.delete(index=client._index)
+        # close client
+        client.close()
 
 
 @pytest.fixture(scope="session")
@@ -198,213 +224,230 @@ def count_docs_in_index(os_store: OpensearchVectorStore) -> int:
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 def test_functionality(
-    os_store: OpensearchVectorStore, node_embeddings: List[TextNode]
+    os_stores: List[OpensearchVectorStore], node_embeddings: List[TextNode]
 ) -> None:
-    # add
-    assert len(os_store.add(node_embeddings)) == len(node_embeddings)
-    # query
-    exp_node = node_embeddings[3]
-    query = VectorStoreQuery(query_embedding=exp_node.embedding, similarity_top_k=1)
-    query_result = os_store.query(query)
-    assert query_result.nodes
-    assert query_result.nodes[0].get_content() == exp_node.text
-    # delete one node using its associated doc_id
-    os_store.delete("test-1")
-    assert count_docs_in_index(os_store) == len(node_embeddings) - 1
+    for os_store in os_stores:
+        # add
+        assert len(os_store.add(node_embeddings)) == len(node_embeddings)
+        # query
+        exp_node = node_embeddings[3]
+        query = VectorStoreQuery(query_embedding=exp_node.embedding, similarity_top_k=1)
+        query_result = os_store.query(query)
+        assert query_result.nodes
+        assert query_result.nodes[0].get_content() == exp_node.text
+        # delete one node using its associated doc_id
+        os_store.delete("test-1")
+        assert count_docs_in_index(os_store) == len(node_embeddings) - 1
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 async def test_async_functionality(
-    os_store: OpensearchVectorStore, node_embeddings: List[TextNode]
+    os_stores: List[OpensearchVectorStore], node_embeddings: List[TextNode]
 ) -> None:
-    # add
-    assert len(await os_store.async_add(node_embeddings)) == len(node_embeddings)
-    # query
-    exp_node = node_embeddings[3]
-    query = VectorStoreQuery(query_embedding=exp_node.embedding, similarity_top_k=1)
-    query_result = await os_store.aquery(query)
-    assert query_result.nodes
-    assert query_result.nodes[0].get_content() == exp_node.text
-    # delete one node using its associated doc_id
-    await os_store.adelete("test-1")
-    assert count_docs_in_index(os_store) == len(node_embeddings) - 1
+    for os_store in os_stores:
+        # add
+        assert len(await os_store.async_add(node_embeddings)) == len(node_embeddings)
+        # query
+        exp_node = node_embeddings[3]
+        query = VectorStoreQuery(query_embedding=exp_node.embedding, similarity_top_k=1)
+        query_result = await os_store.aquery(query)
+        assert query_result.nodes
+        assert query_result.nodes[0].get_content() == exp_node.text
+        # delete one node using its associated doc_id
+        await os_store.adelete("test-1")
+        assert count_docs_in_index(os_store) == len(node_embeddings) - 1
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 def test_delete_nodes(
-    os_store: OpensearchVectorStore, node_embeddings_2: List[TextNode]
+    os_stores: List[OpensearchVectorStore], node_embeddings_2: List[TextNode]
 ):
-    os_store.add(node_embeddings_2)
+    for os_store in os_stores:
+        os_store.add(node_embeddings_2)
 
-    q = VectorStoreQuery(query_embedding=_get_sample_vector(0.5), similarity_top_k=10)
+        q = VectorStoreQuery(
+            query_embedding=_get_sample_vector(0.5), similarity_top_k=10
+        )
 
-    # test deleting nothing
-    os_store.delete_nodes()
-    time.sleep(1)
-    res = os_store.query(q)
-    assert all(i in res.ids for i in ["aaa", "bbb", "ccc"])
+        # test deleting nothing
+        os_store.delete_nodes()
+        time.sleep(1)
+        res = os_store.query(q)
+        assert all(i in res.ids for i in ["aaa", "bbb", "ccc"])
 
-    # test deleting element that doesn't exist
-    os_store.delete_nodes(["asdf"])
-    time.sleep(1)
-    res = os_store.query(q)
-    assert all(i in res.ids for i in ["aaa", "bbb", "ccc"])
+        # test deleting element that doesn't exist
+        os_store.delete_nodes(["asdf"])
+        time.sleep(1)
+        res = os_store.query(q)
+        assert all(i in res.ids for i in ["aaa", "bbb", "ccc"])
 
-    # test deleting list
-    os_store.delete_nodes(["aaa", "bbb"])
-    time.sleep(1)
-    res = os_store.query(q)
-    assert all(i not in res.ids for i in ["aaa", "bbb"])
-    assert "ccc" in res.ids
+        # test deleting list
+        os_store.delete_nodes(["aaa", "bbb"])
+        time.sleep(1)
+        res = os_store.query(q)
+        assert all(i not in res.ids for i in ["aaa", "bbb"])
+        assert "ccc" in res.ids
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 async def test_adelete_nodes(
-    os_store: OpensearchVectorStore, node_embeddings_2: List[TextNode]
+    os_stores: List[OpensearchVectorStore], node_embeddings_2: List[TextNode]
 ):
-    await os_store.async_add(node_embeddings_2)
+    for os_store in os_stores:
+        await os_store.async_add(node_embeddings_2)
 
-    q = VectorStoreQuery(query_embedding=_get_sample_vector(0.5), similarity_top_k=10)
+        q = VectorStoreQuery(
+            query_embedding=_get_sample_vector(0.5), similarity_top_k=10
+        )
 
-    # test deleting nothing
-    await os_store.adelete_nodes()
-    time.sleep(1)
-    res = await os_store.aquery(q)
-    assert all(i in res.ids for i in ["aaa", "bbb", "ccc"])
+        # test deleting nothing
+        await os_store.adelete_nodes()
+        time.sleep(1)
+        res = await os_store.aquery(q)
+        assert all(i in res.ids for i in ["aaa", "bbb", "ccc"])
 
-    # test deleting element that doesn't exist
-    await os_store.adelete_nodes(["asdf"])
-    time.sleep(1)
-    res = await os_store.aquery(q)
-    assert all(i in res.ids for i in ["aaa", "bbb", "ccc"])
+        # test deleting element that doesn't exist
+        await os_store.adelete_nodes(["asdf"])
+        time.sleep(1)
+        res = await os_store.aquery(q)
+        assert all(i in res.ids for i in ["aaa", "bbb", "ccc"])
 
-    # test deleting list
-    await os_store.adelete_nodes(["aaa", "bbb"])
-    time.sleep(1)
-    res = await os_store.aquery(q)
-    assert all(i not in res.ids for i in ["aaa", "bbb"])
-    assert "ccc" in res.ids
+        # test deleting list
+        await os_store.adelete_nodes(["aaa", "bbb"])
+        time.sleep(1)
+        res = await os_store.aquery(q)
+        assert all(i not in res.ids for i in ["aaa", "bbb"])
+        assert "ccc" in res.ids
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 def test_delete_nodes_metadata(
-    os_store: OpensearchVectorStore, node_embeddings_2: List[TextNode]
+    os_stores: List[OpensearchVectorStore], node_embeddings_2: List[TextNode]
 ) -> None:
-    os_store.add(node_embeddings_2)
+    for os_store in os_stores:
+        os_store.add(node_embeddings_2)
 
-    q = VectorStoreQuery(query_embedding=_get_sample_vector(0.5), similarity_top_k=10)
+        q = VectorStoreQuery(
+            query_embedding=_get_sample_vector(0.5), similarity_top_k=10
+        )
 
-    # test deleting multiple IDs but only one satisfies filter
-    filters = MetadataFilters(
-        filters=[
-            MetadataFilter(
-                key="test_key",
-                value="test_value",
-                operator=FilterOperator.EQ,
-            )
-        ]
-    )
-    os_store.delete_nodes(["aaa", "bbb"], filters=filters)
-    time.sleep(1)
-    res = os_store.query(q)
-    assert all(i in res.ids for i in ["aaa", "ccc", "ddd"])
-    assert "bbb" not in res.ids
+        # test deleting multiple IDs but only one satisfies filter
+        filters = MetadataFilters(
+            filters=[
+                MetadataFilter(
+                    key="test_key",
+                    value="test_value",
+                    operator=FilterOperator.EQ,
+                )
+            ]
+        )
+        os_store.delete_nodes(["aaa", "bbb"], filters=filters)
+        time.sleep(1)
+        res = os_store.query(q)
+        assert all(i in res.ids for i in ["aaa", "ccc", "ddd"])
+        assert "bbb" not in res.ids
 
-    # test deleting one ID which satisfies the filter
-    filters = MetadataFilters(
-        filters=[
-            MetadataFilter(
-                key="test_num",
-                value=1,
-                operator=FilterOperator.EQ,
-            )
-        ]
-    )
-    os_store.delete_nodes(["aaa"], filters=filters)
-    time.sleep(1)
-    res = os_store.query(q)
-    assert all(i not in res.ids for i in ["bbb", "aaa"])
-    assert all(i in res.ids for i in ["ccc", "ddd"])
+        # test deleting one ID which satisfies the filter
+        filters = MetadataFilters(
+            filters=[
+                MetadataFilter(
+                    key="test_num",
+                    value=1,
+                    operator=FilterOperator.EQ,
+                )
+            ]
+        )
+        os_store.delete_nodes(["aaa"], filters=filters)
+        time.sleep(1)
+        res = os_store.query(q)
+        assert all(i not in res.ids for i in ["bbb", "aaa"])
+        assert all(i in res.ids for i in ["ccc", "ddd"])
 
-    # test deleting one ID which doesn't satisfy the filter
-    filters = MetadataFilters(
-        filters=[
-            MetadataFilter(
-                key="test_num",
-                value="1",
-                operator=FilterOperator.EQ,
-            )
-        ]
-    )
-    os_store.delete_nodes(["ccc"], filters=filters)
-    time.sleep(1)
-    res = os_store.query(q)
-    assert all(i not in res.ids for i in ["bbb", "aaa"])
-    assert all(i in res.ids for i in ["ccc", "ddd"])
+        # test deleting one ID which doesn't satisfy the filter
+        filters = MetadataFilters(
+            filters=[
+                MetadataFilter(
+                    key="test_num",
+                    value="1",
+                    operator=FilterOperator.EQ,
+                )
+            ]
+        )
+        os_store.delete_nodes(["ccc"], filters=filters)
+        time.sleep(1)
+        res = os_store.query(q)
+        assert all(i not in res.ids for i in ["bbb", "aaa"])
+        assert all(i in res.ids for i in ["ccc", "ddd"])
 
-    # test deleting purely based on filters
-    filters = MetadataFilters(
-        filters=[
-            MetadataFilter(
-                key="test_key_2",
-                value="test_val_2",
-                operator=FilterOperator.EQ,
-            )
-        ]
-    )
-    os_store.delete_nodes(filters=filters)
-    time.sleep(1)
-    res = os_store.query(q)
-    assert all(i not in res.ids for i in ["bbb", "aaa", "ddd"])
-    assert "ccc" in res.ids
+        # test deleting purely based on filters
+        filters = MetadataFilters(
+            filters=[
+                MetadataFilter(
+                    key="test_key_2",
+                    value="test_val_2",
+                    operator=FilterOperator.EQ,
+                )
+            ]
+        )
+        os_store.delete_nodes(filters=filters)
+        time.sleep(1)
+        res = os_store.query(q)
+        assert all(i not in res.ids for i in ["bbb", "aaa", "ddd"])
+        assert "ccc" in res.ids
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 def test_clear(
-    os_store: OpensearchVectorStore, node_embeddings_2: List[TextNode]
+    os_stores: List[OpensearchVectorStore], node_embeddings_2: List[TextNode]
 ) -> None:
-    os_store.add(node_embeddings_2)
+    for os_store in os_stores:
+        os_store.add(node_embeddings_2)
 
-    q = VectorStoreQuery(query_embedding=_get_sample_vector(0.5), similarity_top_k=10)
-    res = os_store.query(q)
-    assert all(i in res.ids for i in ["bbb", "aaa", "ddd", "ccc"])
+        q = VectorStoreQuery(
+            query_embedding=_get_sample_vector(0.5), similarity_top_k=10
+        )
+        res = os_store.query(q)
+        assert all(i in res.ids for i in ["bbb", "aaa", "ddd", "ccc"])
 
-    os_store.clear()
+        os_store.clear()
 
-    time.sleep(1)
+        time.sleep(1)
 
-    res = os_store.query(q)
-    assert all(i not in res.ids for i in ["bbb", "aaa", "ddd", "ccc"])
-    assert len(res.ids) == 0
+        res = os_store.query(q)
+        assert all(i not in res.ids for i in ["bbb", "aaa", "ddd", "ccc"])
+        assert len(res.ids) == 0
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 async def test_aclear(
-    os_store: OpensearchVectorStore, node_embeddings_2: List[TextNode]
+    os_stores: List[OpensearchVectorStore], node_embeddings_2: List[TextNode]
 ) -> None:
-    await os_store.async_add(node_embeddings_2)
+    for os_store in os_stores:
+        await os_store.async_add(node_embeddings_2)
 
-    q = VectorStoreQuery(query_embedding=_get_sample_vector(0.5), similarity_top_k=10)
-    res = await os_store.aquery(q)
-    assert all(i in res.ids for i in ["bbb", "aaa", "ddd", "ccc"])
+        q = VectorStoreQuery(
+            query_embedding=_get_sample_vector(0.5), similarity_top_k=10
+        )
+        res = await os_store.aquery(q)
+        assert all(i in res.ids for i in ["bbb", "aaa", "ddd", "ccc"])
 
-    await os_store.aclear()
+        await os_store.aclear()
 
-    time.sleep(1)
+        time.sleep(1)
 
-    res = await os_store.aquery(q)
-    assert all(i not in res.ids for i in ["bbb", "aaa", "ddd", "ccc"])
-    assert len(res.ids) == 0
+        res = await os_store.aquery(q)
+        assert all(i not in res.ids for i in ["bbb", "aaa", "ddd", "ccc"])
+        assert len(res.ids) == 0
 
 
 @pytest.fixture()
-def insert_document(os_store: OpensearchVectorStore):
+def insert_document():
     """Factory to insert a document with custom metadata into the OpensearchVectorStore."""
 
-    def _insert_document(doc_id: str, metadata: dict):
+    def _insert_document(os_store: OpensearchVectorStore, doc_id: str, metadata: dict):
         """Helper function to insert a document with custom metadata."""
         os_store.add(
             [
@@ -432,7 +475,7 @@ def insert_document(os_store: OpensearchVectorStore):
     ],
 )
 def test_filter_eq(
-    os_store: OpensearchVectorStore,
+    os_stores: List[OpensearchVectorStore],
     insert_document,
     operator: FilterOperator,
     key: str,
@@ -440,25 +483,26 @@ def test_filter_eq(
     false_value,
 ):
     """Test that OpensearchVectorStore correctly applies FilterOperator.EQ/NE in filters."""
-    for meta, id_ in [
-        ({key: value}, "match"),
-        ({key: false_value}, "nomatch1"),
-        ({}, "nomatch2"),
-    ]:
-        insert_document(doc_id=id_, metadata=meta)
+    for os_store in os_stores:
+        for meta, id_ in [
+            ({key: value}, "match"),
+            ({key: false_value}, "nomatch1"),
+            ({}, "nomatch2"),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=meta)
 
-    query = _get_sample_vector_store_query(
-        filters=MetadataFilters(
-            filters=[MetadataFilter(key=key, value=value, operator=operator)]
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key=key, value=value, operator=operator)]
+            )
         )
-    )
-    query_result = os_store.query(query)
+        query_result = os_store.query(query)
 
-    doc_ids = {node.id_ for node in query_result.nodes}
-    if operator == FilterOperator.EQ:
-        assert doc_ids == {"match"}
-    else:  # FilterOperator.NE
-        assert doc_ids == {"nomatch1", "nomatch2"}
+        doc_ids = {node.id_ for node in query_result.nodes}
+        if operator == FilterOperator.EQ:
+            assert doc_ids == {"match"}
+        else:  # FilterOperator.NE
+            assert doc_ids == {"nomatch1", "nomatch2"}
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
@@ -472,25 +516,26 @@ def test_filter_eq(
     ],
 )
 def test_filter_range_number(
-    os_store: OpensearchVectorStore,
+    os_stores: List[OpensearchVectorStore],
     insert_document,
     operator: FilterOperator,
     exp_doc_ids: set,
 ):
     """Test that OpensearchVectorStore correctly applies FilterOperator.GT/GTE/LT/LTE in filters for numbers."""
-    for i in range(1, 5):
-        insert_document(doc_id=f"page{i}", metadata={"page": i})
-    insert_document(doc_id="nomatch", metadata={})
+    for os_store in os_stores:
+        for i in range(1, 5):
+            insert_document(os_store, doc_id=f"page{i}", metadata={"page": i})
+        insert_document(os_store, doc_id="nomatch", metadata={})
 
-    query = _get_sample_vector_store_query(
-        filters=MetadataFilters(
-            filters=[MetadataFilter(key="page", value=2, operator=operator)]
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="page", value=2, operator=operator)]
+            )
         )
-    )
-    query_result = os_store.query(query)
+        query_result = os_store.query(query)
 
-    doc_ids = {node.id_ for node in query_result.nodes}
-    assert doc_ids == exp_doc_ids
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == exp_doc_ids
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
@@ -504,34 +549,37 @@ def test_filter_range_number(
     ],
 )
 def test_filter_range_datetime(
-    os_store: OpensearchVectorStore,
+    os_stores: List[OpensearchVectorStore],
     insert_document,
     operator: FilterOperator,
     exp_doc_ids: set,
 ):
     """Test that OpensearchVectorStore correctly applies FilterOperator.GT/GTE/LT/LTE in filters for datetime."""
-    dt = datetime.now()
-    for i in range(1, 5):
-        insert_document(
-            doc_id=f"date{i}", metadata={"created_at": dt.replace(second=i).isoformat()}
-        )
-    insert_document(doc_id="nomatch", metadata={})
+    for os_store in os_stores:
+        dt = datetime.now()
+        for i in range(1, 5):
+            insert_document(
+                os_store,
+                doc_id=f"date{i}",
+                metadata={"created_at": dt.replace(second=i).isoformat()},
+            )
+        insert_document(os_store, doc_id="nomatch", metadata={})
 
-    query = _get_sample_vector_store_query(
-        filters=MetadataFilters(
-            filters=[
-                MetadataFilter(
-                    key="created_at",
-                    value=dt.replace(second=2).isoformat(),
-                    operator=operator,
-                )
-            ]
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key="created_at",
+                        value=dt.replace(second=2).isoformat(),
+                        operator=operator,
+                    )
+                ]
+            )
         )
-    )
-    query_result = os_store.query(query)
+        query_result = os_store.query(query)
 
-    doc_ids = {node.id_ for node in query_result.nodes}
-    assert doc_ids == exp_doc_ids
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == exp_doc_ids
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
@@ -545,117 +593,188 @@ def test_filter_range_datetime(
 )
 @pytest.mark.parametrize("value", [["product"], ["accounting", "product"]])
 def test_filter_in(
-    os_store: OpensearchVectorStore,
+    os_stores: List[OpensearchVectorStore],
     insert_document,
     operator: FilterOperator,
     exp_doc_ids: Set[str],
     value: List[str],
 ):
-    """Test that OpensearchVectorStore correctly applies FilterOperator.IN/ANY/NIN in filters."""
-    for metadata, id_ in [
-        ({"category": ["product", "management"]}, "match1"),
-        ({"category": ["product", "marketing"]}, "match2"),
-        ({"category": ["management"]}, "nomatch"),
-    ]:
-        insert_document(doc_id=id_, metadata=metadata)
+    for os_store in os_stores:
+        """Test that OpensearchVectorStore correctly applies FilterOperator.IN/ANY/NIN in filters."""
+        for metadata, id_ in [
+            ({"category": ["product", "management"]}, "match1"),
+            ({"category": ["product", "marketing"]}, "match2"),
+            ({"category": ["management"]}, "nomatch"),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=metadata)
 
-    query = _get_sample_vector_store_query(
-        filters=MetadataFilters(
-            filters=[MetadataFilter(key="category", value=value, operator=operator)]
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="category", value=value, operator=operator)]
+            )
         )
-    )
-    query_result = os_store.query(query)
+        query_result = os_store.query(query)
 
-    doc_ids = {node.id_ for node in query_result.nodes}
-    assert doc_ids == exp_doc_ids
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == exp_doc_ids
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 def test_filter_all(
-    os_store: OpensearchVectorStore,
+    os_stores: List[OpensearchVectorStore],
     insert_document,
 ):
-    """Test that OpensearchVectorStore correctly applies FilterOperator.ALL in filters."""
-    for metadata, id_ in [
-        ({"category": ["product", "management", "marketing"]}, "match1"),
-        ({"category": ["product", "marketing"]}, "match2"),
-        ({"category": ["product", "management"]}, "nomatch"),
-    ]:
-        insert_document(doc_id=id_, metadata=metadata)
+    for os_store in os_stores:
+        """Test that OpensearchVectorStore correctly applies FilterOperator.ALL in filters."""
+        for metadata, id_ in [
+            ({"category": ["product", "management", "marketing"]}, "match1"),
+            ({"category": ["product", "marketing"]}, "match2"),
+            ({"category": ["product", "management"]}, "nomatch"),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=metadata)
 
-    query = _get_sample_vector_store_query(
-        filters=MetadataFilters(
-            filters=[
-                MetadataFilter(
-                    key="category",
-                    value=["product", "marketing"],
-                    operator=FilterOperator.ALL,
-                )
-            ]
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key="category",
+                        value=["product", "marketing"],
+                        operator=FilterOperator.ALL,
+                    )
+                ]
+            )
         )
-    )
-    query_result = os_store.query(query)
+        query_result = os_store.query(query)
 
-    doc_ids = {node.id_ for node in query_result.nodes}
-    assert doc_ids == {"match1", "match2"}
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == {"match1", "match2"}
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
 def test_filter_text_match(
-    os_store: OpensearchVectorStore,
+    os_stores: List[OpensearchVectorStore],
     insert_document,
 ):
-    """Test that OpensearchVectorStore correctly applies FilterOperator.TEXT_MATCH in filters. Also tests that
+    """
+    Test that OpensearchVectorStore correctly applies FilterOperator.TEXT_MATCH in filters. Also tests that
     fuzzy matching works as intended.
     """
-    for metadata, id_ in [
-        ({"name": "John Doe"}, "match1"),
-        ({"name": "Doe John Johnson"}, "match2"),
-        ({"name": "Johnny Doe"}, "match3"),
-        ({"name": "Mary Sue"}, "nomatch"),
-    ]:
-        insert_document(doc_id=id_, metadata=metadata)
+    for os_store in os_stores:
+        for metadata, id_ in [
+            ({"name": "John Doe"}, "match1"),
+            ({"name": "Doe John Johnson"}, "match2"),
+            ({"name": "Johnny Doe"}, "match3"),
+            ({"name": "Mary Sue"}, "nomatch"),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=metadata)
 
-    query = _get_sample_vector_store_query(
-        filters=MetadataFilters(
-            filters=[
-                MetadataFilter(
-                    key="name", value="John Doe", operator=FilterOperator.TEXT_MATCH
-                )
-            ]
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key="name", value="John Doe", operator=FilterOperator.TEXT_MATCH
+                    )
+                ]
+            )
         )
-    )
-    query_result = os_store.query(query)
+        query_result = os_store.query(query)
 
-    doc_ids = {node.id_ for node in query_result.nodes}
-    assert doc_ids == {"match1", "match2", "match3"}
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == {"match1", "match2", "match3"}
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
-def test_filter_contains(os_store: OpensearchVectorStore, insert_document):
-    """Test that OpensearchVectorStore correctly applies FilterOperator.CONTAINS in filters. Should only match
+def test_filter_text_match_insensitive(
+    os_stores: List[OpensearchVectorStore],
+    insert_document,
+) -> None:
+    """
+    Test that OpensearchVectorStore correctly applies FilterOperator.TEXT_MATCH_INSENSITIVE
+    in filters. This should behave similarly to TEXT_MATCH for typical text analyzers.
+    """
+    for os_store in os_stores:
+        for metadata, id_ in [
+            ({"name": "John Doe"}, "match1"),
+            ({"name": "Doe John Johnson"}, "match2"),
+            ({"name": "Johnny Doe"}, "match3"),
+            ({"name": "Mary Sue"}, "nomatch"),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=metadata)
+
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key="name",
+                        value="john doe",
+                        operator=FilterOperator.TEXT_MATCH_INSENSITIVE,
+                    )
+                ]
+            )
+        )
+        query_result = os_store.query(query)
+
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == {"match1", "match2", "match3"}
+
+
+@pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
+def test_filter_contains(os_stores: List[OpensearchVectorStore], insert_document):
+    """
+    Test that OpensearchVectorStore correctly applies FilterOperator.CONTAINS in filters. Should only match
     exact substring matches.
     """
-    for metadata, id_ in [
-        ({"name": "John Doe"}, "match1"),
-        ({"name": "Johnny Doe"}, "match2"),
-        ({"name": "Jon Doe"}, "nomatch"),
-    ]:
-        insert_document(doc_id=id_, metadata=metadata)
+    for os_store in os_stores:
+        for metadata, id_ in [
+            ({"name": "John Doe"}, "match1"),
+            ({"name": "Johnny Doe"}, "match2"),
+            ({"name": "Jon Doe"}, "nomatch"),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=metadata)
 
-    query = _get_sample_vector_store_query(
-        filters=MetadataFilters(
-            filters=[
-                MetadataFilter(
-                    key="name", value="ohn", operator=FilterOperator.CONTAINS
-                )
-            ]
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key="name", value="ohn", operator=FilterOperator.CONTAINS
+                    )
+                ]
+            )
         )
-    )
-    query_result = os_store.query(query)
+        query_result = os_store.query(query)
 
-    doc_ids = {node.id_ for node in query_result.nodes}
-    assert doc_ids == {"match1", "match2"}
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == {"match1", "match2"}
+
+
+@pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
+def test_filter_is_empty(os_stores: List[OpensearchVectorStore], insert_document):
+    """
+    Test that OpensearchVectorStore correctly applies FilterOperator.IS_EMPTY in filters. Should only match
+    documents where the specified field doesn't exist.
+    """
+    for os_store in os_stores:
+        for metadata, id_ in [
+            ({"author": "John Doe", "category": "fiction"}, "has_author"),
+            ({"category": "non-fiction", "year": 2023}, "no_author1"),
+            ({"year": 2022, "publisher": "ABC Books"}, "no_author2"),
+            ({}, "no_author3"),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=metadata)
+
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key="author", value=None, operator=FilterOperator.IS_EMPTY
+                    )
+                ]
+            )
+        )
+        query_result = os_store.query(query)
+
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == {"no_author1", "no_author2", "no_author3"}
 
 
 @pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
@@ -698,33 +817,316 @@ def test_filter_contains(os_store: OpensearchVectorStore, insert_document):
     ],
 )
 def test_filter_nested(
-    os_store: OpensearchVectorStore,
+    os_stores: List[OpensearchVectorStore],
     insert_document,
     filters: MetadataFilters,
     exp_match_ids: Set[str],
 ):
-    """Test that OpensearchVectorStore correctly applies nested filters."""
-    for metadata, id_ in [
-        (
-            {"category": ["group1", "group3"], "status": "in_review", "page": 42},
-            "doc_in_category",
-        ),
-        (
-            {"category": ["group3", "group4"], "status": "in_review", "page": 42},
-            "nomatch1",
-        ),
-        (
-            {"category": ["group3", "group4"], "status": "published", "page": 42},
-            "doc_published",
-        ),
-    ]:
-        insert_document(doc_id=id_, metadata=metadata)
-    for i in range(43, 46):
-        insert_document(doc_id=f"page{i}", metadata={"page": i})
-    insert_document(doc_id="nomatch2", metadata={})
+    for os_store in os_stores:
+        """Test that OpensearchVectorStore correctly applies nested filters."""
+        for metadata, id_ in [
+            (
+                {"category": ["group1", "group3"], "status": "in_review", "page": 42},
+                "doc_in_category",
+            ),
+            (
+                {"category": ["group3", "group4"], "status": "in_review", "page": 42},
+                "nomatch1",
+            ),
+            (
+                {"category": ["group3", "group4"], "status": "published", "page": 42},
+                "doc_published",
+            ),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=metadata)
+        for i in range(43, 46):
+            insert_document(os_store, doc_id=f"page{i}", metadata={"page": i})
+        insert_document(os_store, doc_id="nomatch2", metadata={})
 
-    query = _get_sample_vector_store_query(filters=filters)
-    query_result = os_store.query(query)
+        query = _get_sample_vector_store_query(filters=filters)
+        query_result = os_store.query(query)
 
-    doc_ids = {node.id_ for node in query_result.nodes}
-    assert doc_ids == exp_match_ids
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == exp_match_ids
+
+
+@pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
+def test_filter_array_of_strings(
+    os_stores: List[OpensearchVectorStore], insert_document
+):
+    """
+    Test that OpensearchVectorStore correctly applies Filter.Operator.IN filters
+    when the filter value is an array of strings. Should only match all members
+    of the input array exist in the field.
+    """
+    for os_store in os_stores:
+        for metadata, id_ in [
+            ({"location": ["Nevada", "California", "Illinois"]}, "match1"),
+            (
+                {"location": ["Florida", "Nevada", "California", "Kansas", "Illinois"]},
+                "match2",
+            ),
+            ({"location": ["New York", "Nevada", "Oregon"]}, "nomatch"),
+            ({"location": ["Alaska", "Hawaii"]}, "nomatch"),
+        ]:
+            insert_document(os_store, doc_id=id_, metadata=metadata)
+
+        query = _get_sample_vector_store_query(
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key="location",
+                        value=["Nevada", "California", "Illinois"],
+                        operator=FilterOperator.IN,
+                    )
+                ]
+            )
+        )
+        query_result = os_store.query(query)
+
+        doc_ids = {node.id_ for node in query_result.nodes}
+        assert doc_ids == {"match1", "match2"}
+
+
+@pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
+def test_efficient_filtering_used_when_enabled(os_stores: List[OpensearchVectorStore]):
+    """Test that efficient filtering is used when the engine and opensearch version supports it."""
+    os_store = os_stores[0]
+
+    with mock.patch.object(
+        os_store.client, "_default_approximate_search_query"
+    ) as patched_default_approximate_search_query:
+        filters = MetadataFilters(
+            filters=[
+                MetadataFilter(
+                    key="location",
+                    value=["Nevada", "California", "Illinois"],
+                    operator=FilterOperator.IN,
+                )
+            ]
+        )
+        os_store.client._efficient_filtering_enabled = False
+        os_store.client._method["engine"] = "lucene"
+        os_store.client._knn_search_query(
+            embedding_field="embedding", query_embedding=[1], k=20, filters=filters
+        )
+        assert not patched_default_approximate_search_query.called
+
+        os_store.client._efficient_filtering_enabled = True
+        os_store.client._knn_search_query(
+            embedding_field="embedding", query_embedding=[1], k=20, filters=filters
+        )
+        assert patched_default_approximate_search_query.called
+
+
+@pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
+@pytest.mark.parametrize(
+    "query_mode",
+    [
+        VectorStoreQueryMode.DEFAULT,
+        VectorStoreQueryMode.TEXT_SEARCH,
+        VectorStoreQueryMode.HYBRID,
+    ],
+)
+def test_excluded_source_fields(
+    os_stores: List[OpensearchVectorStore],
+    node_embeddings: List[TextNode],
+    query_mode: VectorStoreQueryMode,
+):
+    os_store = os_stores[0]
+    os_store.add(node_embeddings)
+    os_store.client._search_pipeline = "search_pipeline"  # value doesn't matter
+
+    # set excluded source fields
+    excluded_fields = ["embedding"]
+    os_store.client._excluded_source_fields = excluded_fields
+
+    with mock.patch.object(os_store.client._os_client, "search") as patched_search:
+        exp_node = node_embeddings[3]
+        query = VectorStoreQuery(
+            query_embedding=exp_node.embedding,
+            similarity_top_k=1,
+            mode=query_mode,
+            query_str=exp_node.text,
+        )
+        os_store.query(query)
+        assert patched_search.called
+
+        kwargs = patched_search.call_args.kwargs
+        body = kwargs["body"]
+        assert "_source" in body
+        assert "exclude" in body["_source"]
+        assert body["_source"]["exclude"] == excluded_fields
+
+    kwargs.pop("params", None)  # params not needed, even when testing hybrid
+    res = os_store.client._os_client.search(params=None, **kwargs)
+    assert len(res["hits"]["hits"]) > 0
+    for hit in res["hits"]["hits"]:
+        source = hit["_source"]
+        for ex in excluded_fields:
+            assert ex not in source
+
+
+@pytest.mark.skipif(opensearch_not_available, reason="opensearch is not available")
+@pytest.mark.parametrize(
+    "query_mode",
+    [
+        VectorStoreQueryMode.DEFAULT,
+        VectorStoreQueryMode.TEXT_SEARCH,
+        VectorStoreQueryMode.HYBRID,
+    ],
+)
+def test_no_excluded_source_fields(
+    os_stores: List[OpensearchVectorStore],
+    node_embeddings: List[TextNode],
+    query_mode: VectorStoreQueryMode,
+) -> None:
+    os_store = os_stores[0]
+    os_store.add(node_embeddings)
+    os_store.client._search_pipeline = "search_pipeline"  # value doesn't matter
+
+    # explicitly show `None` for excluded source fields (default)
+    os_store.client._excluded_source_fields = None
+
+    with mock.patch.object(os_store.client._os_client, "search") as patched_search:
+        exp_node = node_embeddings[3]
+        query = VectorStoreQuery(
+            query_embedding=exp_node.embedding,
+            similarity_top_k=1,
+            mode=query_mode,
+            query_str=exp_node.text,
+        )
+        os_store.query(query)
+        assert patched_search.called
+
+        body = patched_search.call_args.kwargs["body"]
+        assert "_source" not in body
+
+
+def _make_client_with_mocks(owns_sync=True, owns_async=True):
+    """Helper to create an OpensearchVectorClient with mock underlying clients."""
+    mock_sync_client = mock.MagicMock()
+    mock_async_client = mock.MagicMock()
+    mock_async_client.close = mock.AsyncMock()
+
+    client = OpensearchVectorClient.__new__(OpensearchVectorClient)
+    client._os_client = mock_sync_client
+    client._os_async_client = mock_async_client
+    client._owns_os_client = owns_sync
+    client._owns_os_async_client = owns_async
+
+    return client, mock_sync_client, mock_async_client
+
+
+def test_close_calls_underlying_clients() -> None:
+    """Test that OpensearchVectorClient.close() calls close on both owned clients."""
+    client, mock_sync, mock_async = _make_client_with_mocks()
+
+    client.close()
+
+    mock_sync.close.assert_called_once()
+    mock_async.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_aclose_calls_underlying_clients() -> None:
+    """Test that OpensearchVectorClient.aclose() calls close on both owned clients."""
+    client, mock_sync, mock_async = _make_client_with_mocks()
+
+    await client.aclose()
+
+    mock_sync.close.assert_called_once()
+    mock_async.close.assert_called_once()
+
+
+def test_close_respects_ownership() -> None:
+    """Test that close() does not close externally-provided clients."""
+    client, mock_sync, mock_async = _make_client_with_mocks(
+        owns_sync=False, owns_async=False
+    )
+
+    client.close()
+
+    mock_sync.close.assert_not_called()
+    mock_async.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aclose_respects_ownership() -> None:
+    """Test that aclose() does not close externally-provided clients."""
+    client, mock_sync, mock_async = _make_client_with_mocks(
+        owns_sync=False, owns_async=False
+    )
+
+    await client.aclose()
+
+    mock_sync.close.assert_not_called()
+    mock_async.close.assert_not_called()
+
+
+def test_del_calls_close() -> None:
+    """Test that __del__ triggers close() on OpensearchVectorClient."""
+    client, mock_sync, mock_async = _make_client_with_mocks()
+
+    client.__del__()
+
+    mock_sync.close.assert_called_once()
+
+
+def test_del_suppresses_exceptions() -> None:
+    """Test that __del__ doesn't propagate errors."""
+    client, mock_sync, mock_async = _make_client_with_mocks()
+    mock_sync.close.side_effect = RuntimeError("connection lost")
+
+    # Should not raise
+    client.__del__()
+
+
+def test_store_close_calls_client_close() -> None:
+    """Test that OpensearchVectorStore.close() calls close on the underlying client."""
+    mock_client = mock.MagicMock(spec=OpensearchVectorClient)
+
+    store = OpensearchVectorStore.__new__(OpensearchVectorStore)
+    store._client = mock_client
+
+    store.close()
+
+    mock_client.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_store_aclose_calls_client_aclose() -> None:
+    """Test that OpensearchVectorStore.aclose() calls aclose on the underlying client."""
+    mock_client = mock.MagicMock(spec=OpensearchVectorClient)
+    mock_client.aclose = mock.AsyncMock()
+
+    store = OpensearchVectorStore.__new__(OpensearchVectorStore)
+    store._client = mock_client
+
+    await store.aclose()
+
+    mock_client.aclose.assert_called_once()
+
+
+def test_store_del_calls_close() -> None:
+    """Test that __del__ on OpensearchVectorStore triggers close()."""
+    mock_client = mock.MagicMock(spec=OpensearchVectorClient)
+
+    store = OpensearchVectorStore.__new__(OpensearchVectorStore)
+    store._client = mock_client
+
+    store.__del__()
+
+    mock_client.close.assert_called_once()
+
+
+def test_store_del_suppresses_exceptions() -> None:
+    """Test that __del__ on OpensearchVectorStore doesn't propagate errors."""
+    mock_client = mock.MagicMock(spec=OpensearchVectorClient)
+    mock_client.close.side_effect = RuntimeError("connection lost")
+
+    store = OpensearchVectorStore.__new__(OpensearchVectorStore)
+    store._client = mock_client
+
+    # Should not raise
+    store.__del__()

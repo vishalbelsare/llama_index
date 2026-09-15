@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from llama_index.core.base.llms.types import (
     ChatMessage,
@@ -23,12 +24,13 @@ from llama_index.core.indices.base_retriever import BaseRetriever
 from llama_index.core.indices.query.schema import QueryBundle
 from llama_index.core.base.llms.generic_utils import messages_to_history_str
 from llama_index.core.llms.llm import LLM
-from llama_index.core.memory import BaseMemory, ChatMemoryBuffer
+from llama_index.core.memory import BaseMemory, Memory
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.response_synthesizers import CompactAndRefine
 from llama_index.core.schema import NodeWithScore
 from llama_index.core.settings import Settings
+from llama_index.core.types import Thread
 from llama_index.core.utilities.token_counting import TokenCounter
 from llama_index.core.chat_engine.utils import (
     get_prefix_messages_with_context,
@@ -92,9 +94,9 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         retriever: BaseRetriever,
         llm: LLM,
         memory: BaseMemory,
-        context_prompt: Optional[str] = None,
-        context_refine_prompt: Optional[str] = None,
-        condense_prompt: Optional[str] = None,
+        context_prompt: Optional[Union[str, PromptTemplate]] = None,
+        context_refine_prompt: Optional[Union[str, PromptTemplate]] = None,
+        condense_prompt: Optional[Union[str, PromptTemplate]] = None,
         system_prompt: Optional[str] = None,
         skip_condense: bool = False,
         node_postprocessors: Optional[List[BaseNodePostprocessor]] = None,
@@ -104,14 +106,24 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         self._retriever = retriever
         self._llm = llm
         self._memory = memory
-        self._context_prompt_template = (
-            context_prompt or DEFAULT_CONTEXT_PROMPT_TEMPLATE
-        )
-        self._context_refine_prompt_template = (
+
+        context_prompt = context_prompt or DEFAULT_CONTEXT_PROMPT_TEMPLATE
+        if isinstance(context_prompt, str):
+            context_prompt = PromptTemplate(context_prompt)
+        self._context_prompt_template = context_prompt
+
+        context_refine_prompt = (
             context_refine_prompt or DEFAULT_CONTEXT_REFINE_PROMPT_TEMPLATE
         )
-        condense_prompt_str = condense_prompt or DEFAULT_CONDENSE_PROMPT_TEMPLATE
-        self._condense_prompt_template = PromptTemplate(condense_prompt_str)
+        if isinstance(context_refine_prompt, str):
+            context_refine_prompt = PromptTemplate(context_refine_prompt)
+        self._context_refine_prompt_template = context_refine_prompt
+
+        condense_prompt = condense_prompt or DEFAULT_CONDENSE_PROMPT_TEMPLATE
+        if isinstance(condense_prompt, str):
+            condense_prompt = PromptTemplate(condense_prompt)
+        self._condense_prompt_template = condense_prompt
+
         self._system_prompt = system_prompt
         self._skip_condense = skip_condense
         self._node_postprocessors = node_postprocessors or []
@@ -130,9 +142,9 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         chat_history: Optional[List[ChatMessage]] = None,
         memory: Optional[BaseMemory] = None,
         system_prompt: Optional[str] = None,
-        context_prompt: Optional[str] = None,
-        context_refine_prompt: Optional[str] = None,
-        condense_prompt: Optional[str] = None,
+        context_prompt: Optional[Union[str, PromptTemplate]] = None,
+        context_refine_prompt: Optional[Union[str, PromptTemplate]] = None,
+        condense_prompt: Optional[Union[str, PromptTemplate]] = None,
         skip_condense: bool = False,
         node_postprocessors: Optional[List[BaseNodePostprocessor]] = None,
         verbose: bool = False,
@@ -142,7 +154,7 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         llm = llm or Settings.llm
 
         chat_history = chat_history or []
-        memory = memory or ChatMemoryBuffer.from_defaults(
+        memory = memory or Memory.from_defaults(
             chat_history=chat_history, token_limit=llm.metadata.context_window - 256
         )
 
@@ -206,7 +218,7 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         """Generate context information from a message."""
         nodes = await self._retriever.aretrieve(message)
         for postprocessor in self._node_postprocessors:
-            nodes = postprocessor.postprocess_nodes(
+            nodes = await postprocessor.apostprocess_nodes(
                 nodes, query_bundle=QueryBundle(message)
             )
 
@@ -232,7 +244,13 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         )
 
         return get_response_synthesizer(
-            self._llm, self.callback_manager, qa_messages, refine_messages, streaming
+            self._llm,
+            self.callback_manager,
+            qa_messages,
+            refine_messages,
+            streaming,
+            qa_function_mappings=self._context_prompt_template.function_mappings,
+            refine_function_mappings=self._context_refine_prompt_template.function_mappings,
         )
 
     def _run_c3(
@@ -275,9 +293,9 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         streaming: bool = False,
     ) -> Tuple[CompactAndRefine, ToolOutput, List[NodeWithScore]]:
         if chat_history is not None:
-            self._memory.set(chat_history)
+            await self._memory.aset(chat_history)
 
-        chat_history = self._memory.get(input=message)
+        chat_history = await self._memory.aget(input=message)
 
         # Condense conversation history and latest message to a standalone question
         condensed_question = await self._acondense_question(chat_history, message)  # type: ignore
@@ -331,6 +349,9 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         )
 
         response = synthesizer.synthesize(message, context_nodes)
+        assert isinstance(response, StreamingResponse)
+
+        self._memory.put(ChatMessage(content=message, role=MessageRole.USER))
 
         def wrapped_gen(response: StreamingResponse) -> ChatResponseGen:
             full_response = ""
@@ -343,19 +364,17 @@ class CondensePlusContextChatEngine(BaseChatEngine):
                     delta=token,
                 )
 
-            user_message = ChatMessage(content=message, role=MessageRole.USER)
-            assistant_message = ChatMessage(
-                content=full_response, role=MessageRole.ASSISTANT
-            )
-            self._memory.put(user_message)
-            self._memory.put(assistant_message)
-
-        return StreamingAgentChatResponse(
+        chat_response = StreamingAgentChatResponse(
             chat_stream=wrapped_gen(response),
             sources=[context_source],
             source_nodes=context_nodes,
-            is_writing_to_memory=False,
         )
+        thread = Thread(
+            target=chat_response.write_response_to_history, args=(self._memory,)
+        )
+        chat_response.write_response_to_history_thread = thread
+        thread.start()
+        return chat_response
 
     @trace_method("chat")
     async def achat(
@@ -389,6 +408,9 @@ class CondensePlusContextChatEngine(BaseChatEngine):
         )
 
         response = await synthesizer.asynthesize(message, context_nodes)
+        assert isinstance(response, AsyncStreamingResponse)
+
+        await self._memory.aput(ChatMessage(content=message, role=MessageRole.USER))
 
         async def wrapped_gen(response: AsyncStreamingResponse) -> ChatResponseAsyncGen:
             full_response = ""
@@ -401,19 +423,15 @@ class CondensePlusContextChatEngine(BaseChatEngine):
                     delta=token,
                 )
 
-            user_message = ChatMessage(content=message, role=MessageRole.USER)
-            assistant_message = ChatMessage(
-                content=full_response, role=MessageRole.ASSISTANT
-            )
-            await self._memory.aput(user_message)
-            await self._memory.aput(assistant_message)
-
-        return StreamingAgentChatResponse(
+        chat_response = StreamingAgentChatResponse(
             achat_stream=wrapped_gen(response),
             sources=[context_source],
             source_nodes=context_nodes,
-            is_writing_to_memory=False,
         )
+        chat_response.awrite_response_to_history_task = asyncio.create_task(
+            chat_response.awrite_response_to_history(self._memory)
+        )
+        return chat_response
 
     def reset(self) -> None:
         # Clear chat history
